@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <title>RevascLogic v1.2: The Completeness Paradox</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <!-- fonts removed for offline use -->
   <style>
     /* --- Theme: "Hemodynamic Flux" --- */
     :root {
@@ -237,25 +237,35 @@
   </aside>
 </div>
 
-<!-- WORKER -->
-<script id="worker-code" type="javascript/worker">
-  self.onmessage = function(e) {
-    const { trials, baselineRisk, harmPenalty, nSims } = e.data;
-    
+<!-- Pure statistical core (single source of truth; also runs under Node for tests) -->
+<script src="engine.js"></script>
+
+<script>
+  /* --- MONTE-CARLO SIMULATION (ported from the former web-worker, run synchronously) ---
+     The HKSJ pooling lives in engine.js (runHKSJ); only the stochastic competing-risk
+     projection lives here because it depends on Math.random. */
+  function downsample(arr, n) {
+    if(arr.length <= n) return arr;
+    const res = [];
+    const step = Math.floor(arr.length/n);
+    for(let i=0; i<n; i++) res.push(arr[i*step]);
+    return res;
+  }
+
+  function computeResults({ trials, baselineRisk, harmPenalty, nSims }) {
     // 1. Filter Active
     const activeTrials = trials.filter(t => t.active);
-    if(activeTrials.length === 0) { self.postMessage({error:true}); return; }
+    if(activeTrials.length === 0) return null;
 
-    // 2. Run Meta-Analysis (HKSJ Adjustment)
-    // We run DSL first to get weights, then apply HKSJ correction
+    // 2. Run Meta-Analysis (HKSJ)
     const maEff = runHKSJ(activeTrials, 'logOR_eff', 'se_eff');
     const maSaf = runHKSJ(activeTrials, 'logOR_saf', 'se_saf');
 
     // 3. Monte Carlo (Correlated Competing Risks)
     // Correlation between Safety and Efficacy (Better centers do both better)
     const rho = 0.5;
-    
-    let ratioMI = baselineRisk > 0.20 ? 0.6 : 2.0; 
+
+    let ratioMI = baselineRisk > 0.20 ? 0.6 : 2.0;
     const baseRiskMI = baselineRisk * ratioMI;
     const baseRiskSafe = baselineRisk;
 
@@ -266,10 +276,10 @@
         // Generate Correlated Z-scores
         let u1=Math.random(), u2=Math.random();
         let u3=Math.random(), u4=Math.random();
-        
+
         let z_eff_indep = Math.sqrt(-2*Math.log(u1))*Math.cos(2*Math.PI*u2);
         let z_saf_indep = Math.sqrt(-2*Math.log(u3))*Math.cos(2*Math.PI*u4);
-        
+
         let z_eff = z_eff_indep;
         // Correlate Safety with Efficacy
         let z_saf = (rho * z_eff_indep) + (Math.sqrt(1 - rho*rho) * z_saf_indep);
@@ -281,128 +291,32 @@
         let riskMI_comp = (baseRiskMI * simOR_eff) / (1 - baseRiskMI + (baseRiskMI * simOR_eff));
         let riskSafe_comp = (baseRiskSafe * simOR_saf) / (1 - baseRiskSafe + (baseRiskSafe * simOR_saf));
 
-        // Competing Risk Logic (Hierarchy)
-        // Draw outcomes for Complete Arm
-        let outcome = 'neutral';
-        
-        // Safety Event Check (Death/Renal) - Trumps MI
-        if(Math.random() < riskSafe_comp) {
-            outcome = 'harm';
-        } 
-        // If survived, check for MI
-        else if (Math.random() < riskMI_comp) {
-            outcome = 'mi';
-        }
-
-        // Compare against Baseline (Expected)
-        // Baseline Expected MI count = baseRiskMI
-        // Baseline Expected Safety count = baseRiskSafe
-        
         // This is a Risk Difference Simulation, slightly abstracted
         let diff_safe = riskSafe_comp - baseRiskSafe; // + means Harm
         let diff_mi = riskMI_comp - baseRiskMI;       // - means Benefit
-        
+
         // Net Clinical Benefit: (Benefit) - (Harm)
-        // Benefit = Saved MI (-diff_mi)
-        // Harm = Caused Death (+diff_safe)
         let ncb = (-diff_mi) - (diff_safe);
-        
+
         ncbDist.push(ncb);
         if(ncb > 0) completeWins++;
     }
-    
+
     ncbDist.sort((a,b) => a-b);
     const meanNCB = ncbDist.reduce((a,b)=>a+b,0)/nSims;
     const probComplete = completeWins / nSims;
 
-    self.postMessage({
-        type: 'complete',
-        results: {
-            maEff,
-            maSaf,
-            meanNCB,
-            probComplete,
-            ncbDist: downsample(ncbDist, 100),
-            baseRiskMI,
-            baseRiskSafe
-        }
-    });
-  };
-
-  // Hartung-Knapp-Sidik-Jonkman (HKSJ) Implementation
-  function runHKSJ(data, kEff, kSe) {
-    const y = data.map(d => d[kEff]);
-    const v = data.map(d => d[kSe]**2);
-    
-    // 1. Standard DSL for Tau2 and Initial Weights
-    const wFE = v.map(x => 1/x);
-    const swFE = wFE.reduce((a,b)=>a+b,0);
-    const muFE = wFE.reduce((a,b,j)=>a+b*y[j],0)/swFE;
-    
-    let Q = 0; y.forEach((val, i) => Q += wFE[i]*(val-muFE)**2);
-    const k = data.length;
-    const df = k - 1;
-    const C = swFE - wFE.reduce((a,b)=>a+b*b,0)/swFE;
-    const tau2 = Math.max(0, (Q - df)/C);
-    const I2 = Math.max(0, (Q-df)/Q)*100;
-
-    // 2. HKSJ Refinement
-    const wRE = v.map(x => 1/(x+tau2));
-    const swRE = wRE.reduce((a,b)=>a+b,0);
-    const muRE = wRE.reduce((a,b,j)=>a+b*y[j],0)/swRE;
-    
-    // HKSJ Variance Inflation
-    let q_term = 0;
-    y.forEach((val, i) => q_term += wRE[i] * (val - muRE)**2);
-    
-    let var_hksj = 0;
-    if (k > 1) {
-       var_hksj = (q_term / ((k-1) * swRE));
-       // Safety clamp: HKSJ variance shouldn't be insanely small if Q is small, but strictly it replaces DSL SE.
-       // However, often implemented as Max(var_DSL, var_HKSJ) or strictly var_HKSJ. 
-       // We will use strict HKSJ but ensure it doesn't break on k=1.
-    } else {
-       var_hksj = 1/swRE; // Fallback
-    }
-
-    const seRE = Math.sqrt(var_hksj);
-    
-    // Critical value: t-distribution (df = k-1)
-    // Approx t-value for 95% CI
-    let tVal = 1.96;
-    if(k <= 2) tVal = 12.7; // df=1
-    else if(k === 3) tVal = 4.3; // df=2
-    else if(k === 4) tVal = 3.18; 
-    else if(k === 5) tVal = 2.77;
-    else if(k < 10) tVal = 2.3;
-    else tVal = 2.05; // Converges to 1.96
-
     return {
-        mu: muRE,
-        se_pool: seRE,
-        tVal: tVal, // Pass for CI calc
-        tau2: tau2,
-        I2: I2,
-        trials: data.map(d => ({ 
-            id: d.id, 
-            or: Math.exp(d[kEff]), 
-            lo: Math.exp(d[kEff] - 1.96*d[kSe]),
-            hi: Math.exp(d[kEff] + 1.96*d[kSe]),
-            active: d.active 
-        }))
+        maEff,
+        maSaf,
+        meanNCB,
+        probComplete,
+        ncbDist: downsample(ncbDist, 100),
+        baseRiskMI,
+        baseRiskSafe
     };
   }
 
-  function downsample(arr, n) {
-    if(arr.length <= n) return arr;
-    const res = [];
-    const step = Math.floor(arr.length/n);
-    for(let i=0; i<n; i++) res.push(arr[i*step]);
-    return res;
-  }
-</script>
-
-<script>
   /* --- DATABASE --- */
   const DB = [
     { id: "PRAMI",      tag: "Stable", n: 465,  logOR_eff: Math.log(0.35), se_eff: 0.25, logOR_saf: Math.log(1.00), se_saf: 0.30, active: true },
@@ -419,18 +333,6 @@
     trials: JSON.parse(JSON.stringify(DB)),
     baselineRisk: 0.05,
     harmPenalty: 1.0,
-  };
-
-  /* --- WORKER --- */
-  const blob = new Blob([document.getElementById('worker-code').textContent], {type: "text/javascript"});
-  const worker = new Worker(window.URL.createObjectURL(blob));
-  
-  worker.onmessage = function(e) {
-    if(e.data.results) {
-        renderUI(e.data.results);
-        document.getElementById('runBtn').classList.remove('processing');
-        document.getElementById('runBtn').disabled = false;
-    }
   };
 
   /* --- ACTIONS --- */
@@ -482,15 +384,13 @@
   }
 
   function runSimulation() {
-    document.getElementById('runBtn').classList.add('processing');
-    document.getElementById('runBtn').disabled = true;
-
-    worker.postMessage({
+    const res = computeResults({
         trials: state.trials,
         baselineRisk: parseFloat(document.getElementById('riskInput').value)/100,
         harmPenalty: parseFloat(document.getElementById('harmInput').value),
         nSims: 20000
     });
+    if(res) renderUI(res);
   }
 
   /* --- RENDERERS --- */
